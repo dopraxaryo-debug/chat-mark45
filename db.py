@@ -19,11 +19,14 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS users (
                     id BIGINT PRIMARY KEY,
                     username TEXT,
+                    first_name TEXT,
                     link_token TEXT UNIQUE NOT NULL,
                     is_banned BOOLEAN DEFAULT FALSE,
                     created_at TIMESTAMP DEFAULT NOW()
                 );
             """)
+            # برای دیتابیس‌هایی که از قبل ساخته شدن و ستون جدید رو ندارن
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT;")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS anon_identities (
                     owner_id BIGINT NOT NULL,
@@ -62,19 +65,38 @@ def init_db():
                     created_at TIMESTAMP DEFAULT NOW()
                 );
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS reports (
+                    id SERIAL PRIMARY KEY,
+                    owner_id BIGINT NOT NULL,
+                    sender_id BIGINT NOT NULL,
+                    message_text TEXT,
+                    content_type TEXT,
+                    file_id TEXT,
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
 
 
-def get_or_create_user(user_id, username):
+def get_or_create_user(user_id, username, first_name=None):
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
             row = cur.fetchone()
             if row:
+                # اگه یوزرنیم یا اسم عوض شده باشه، به‌روزش می‌کنیم
+                if row["username"] != username or row.get("first_name") != first_name:
+                    cur.execute(
+                        "UPDATE users SET username = %s, first_name = %s WHERE id = %s RETURNING *",
+                        (username, first_name, user_id),
+                    )
+                    return cur.fetchone()
                 return row
             token = secrets.token_urlsafe(6)
             cur.execute(
-                "INSERT INTO users (id, username, link_token) VALUES (%s, %s, %s) RETURNING *",
-                (user_id, username, token),
+                "INSERT INTO users (id, username, first_name, link_token) VALUES (%s, %s, %s, %s) RETURNING *",
+                (user_id, username, first_name, token),
             )
             return cur.fetchone()
 
@@ -83,6 +105,13 @@ def get_user_by_token(token):
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("SELECT * FROM users WHERE link_token = %s", (token,))
+            return cur.fetchone()
+
+
+def get_user_by_id(user_id):
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
             return cur.fetchone()
 
 
@@ -160,6 +189,42 @@ def log_message(owner_id, sender_id, direction, content_type, text_content=None,
             )
 
 
+def get_last_message(owner_id, sender_id):
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT * FROM messages
+                   WHERE owner_id = %s AND sender_id = %s AND direction = 'to_owner'
+                   ORDER BY created_at DESC LIMIT 1""",
+                (owner_id, sender_id),
+            )
+            return cur.fetchone()
+
+
+def create_report(owner_id, sender_id, content_type, text_content, file_id):
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """INSERT INTO reports (owner_id, sender_id, content_type, message_text, file_id)
+                   VALUES (%s, %s, %s, %s, %s) RETURNING *""",
+                (owner_id, sender_id, content_type, text_content, file_id),
+            )
+            return cur.fetchone()
+
+
+def get_pending_reports():
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM reports WHERE status = 'pending' ORDER BY created_at DESC")
+            return cur.fetchall()
+
+
+def resolve_report(report_id):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE reports SET status = 'resolved' WHERE id = %s", (report_id,))
+
+
 def create_ticket(user_id, message):
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -229,11 +294,14 @@ def get_stats():
             blocks_count = cur.fetchone()["c"]
             cur.execute("SELECT COUNT(*) AS c FROM support_tickets WHERE status = 'pending'")
             pending_tickets = cur.fetchone()["c"]
+            cur.execute("SELECT COUNT(*) AS c FROM reports WHERE status = 'pending'")
+            pending_reports = cur.fetchone()["c"]
             return {
                 "users": users_count,
                 "messages": messages_count,
                 "blocks": blocks_count,
                 "pending_tickets": pending_tickets,
+                "pending_reports": pending_reports,
             }
 
 

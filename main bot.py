@@ -17,6 +17,11 @@ TOKEN = os.environ.get("BOT_TOKEN")
 BOT_USERNAME = os.environ.get("BOT_USERNAME")  # بدون @ - مثلا MyAnonBot
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
 
+# آیدی یا یوزرنیم کانال‌های اجباری - با @ یا به شکل عددی (-100...)
+REQUIRED_CHANNELS = [
+    c.strip() for c in os.environ.get("REQUIRED_CHANNELS", "").split(",") if c.strip()
+]
+
 MAIN_MENU = ReplyKeyboardMarkup(
     [["🔗 لینک من"], ["🚫 لیست مسدودی‌ها", "🆘 پشتیبانی"]],
     resize_keyboard=True,
@@ -27,37 +32,85 @@ def is_admin(user_id):
     return user_id in ADMIN_IDS
 
 
+async def get_not_joined_channels(context, user_id):
+    """کانال‌هایی که کاربر هنوز عضوشون نشده رو برمی‌گردونه."""
+    not_joined = []
+    for channel in REQUIRED_CHANNELS:
+        try:
+            member = await context.bot.get_chat_member(channel, user_id)
+            if member.status in ("left", "kicked"):
+                not_joined.append(channel)
+        except Exception:
+            # اگه بات نتونه چک کنه (مثلا ادمین اون کانال نیست)، به‌جای بلاک کردن کاربر، رد می‌شیم
+            logging.warning("نمی‌تونم عضویت کانال %s رو چک کنم", channel)
+    return not_joined
+
+
+def join_keyboard(not_joined):
+    rows = []
+    for channel in not_joined:
+        handle = channel.lstrip("@")
+        rows.append([InlineKeyboardButton(f"عضویت در {channel}", url=f"https://t.me/{handle}")])
+    rows.append([InlineKeyboardButton("✅ عضو شدم", callback_data="checkjoin")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def require_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """اگه کاربر عضو کانال‌های اجباری نباشه، پیام عضویت رو می‌فرسته و True برمی‌گردونه."""
+    tg_user = update.effective_user
+    if is_admin(tg_user.id) or not REQUIRED_CHANNELS:
+        return False
+
+    not_joined = await get_not_joined_channels(context, tg_user.id)
+    if not_joined:
+        await update.effective_message.reply_text(
+            "برای استفاده از بات، اول باید عضو کانال‌های زیر بشی:",
+            reply_markup=join_keyboard(not_joined),
+        )
+        return True
+    return False
+
+
 # ---------- بخش کاربر عادی ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_user = update.effective_user
-    user = db.get_or_create_user(tg_user.id, tg_user.username)
 
-    if user["is_banned"]:
-        await update.message.reply_text("متاسفانه دسترسی شما مسدود شده.")
+    if await require_join(update, context):
+        # قبل از چک عضویت، پارامتر لینک (اگه بود) رو نگه می‌داریم تا بعد از عضویت گم نشه
+        if context.args:
+            context.user_data["pending_start_token"] = context.args[0]
         return
 
-    args = context.args
-    if args:
-        token = args[0]
+    await process_start(update.message.reply_text, context, tg_user, context.args[0] if context.args else None)
+
+
+async def process_start(reply_func, context, tg_user, token):
+    user = db.get_or_create_user(tg_user.id, tg_user.username, tg_user.first_name)
+
+    if user["is_banned"]:
+        await reply_func("متاسفانه دسترسی شما مسدود شده.")
+        return
+
+    if token:
         target = db.get_user_by_token(token)
         if not target:
-            await update.message.reply_text("این لینک معتبر نیست.")
+            await reply_func("این لینک معتبر نیست.")
             return
         if target["id"] == tg_user.id:
-            await update.message.reply_text("این لینک خودته! نمی‌تونی برای خودت پیام ناشناس بفرستی 😄")
+            await reply_func("این لینک خودته! نمی‌تونی برای خودت پیام ناشناس بفرستی 😄")
             return
         if target["is_banned"]:
-            await update.message.reply_text("این کاربر در دسترس نیست.")
+            await reply_func("این کاربر در دسترس نیست.")
             return
 
         context.user_data["compose_target"] = target["id"]
         context.user_data.pop("reply_to", None)
         context.user_data.pop("support_mode", None)
-        await update.message.reply_text("پیامتو بنویس، کاملاً ناشناس براش ارسال می‌شه 🙊")
+        await reply_func("پیامتو بنویس، کاملاً ناشناس براش ارسال می‌شه 🙊")
         return
 
-    await update.message.reply_text(
+    await reply_func(
         "سلام! 👋 با این بات می‌تونی لینک اختصاصی خودتو بسازی و پیام‌های ناشناس بگیری.\n\n"
         "از دکمه‌های پایین استفاده کن.",
         reply_markup=MAIN_MENU,
@@ -65,13 +118,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await require_join(update, context):
+        return
     tg_user = update.effective_user
-    user = db.get_or_create_user(tg_user.id, tg_user.username)
+    user = db.get_or_create_user(tg_user.id, tg_user.username, tg_user.first_name)
     link = f"https://t.me/{BOT_USERNAME}?start={user['link_token']}"
     await update.message.reply_text(f"این لینک اختصاصی توئه، هرجا خواستی به اشتراک بذار:\n\n{link}")
 
 
 async def show_blocked(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await require_join(update, context):
+        return
     owner_id = update.effective_user.id
     blocked = db.list_blocked(owner_id)
     if not blocked:
@@ -86,6 +143,8 @@ async def show_blocked(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def start_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await require_join(update, context):
+        return
     context.user_data["support_mode"] = True
     context.user_data.pop("compose_target", None)
     context.user_data.pop("reply_to", None)
@@ -114,7 +173,11 @@ async def copy_content(context, chat_id, msg):
 
 async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_user = update.effective_user
-    user = db.get_or_create_user(tg_user.id, tg_user.username)
+
+    if not is_admin(tg_user.id) and await require_join(update, context):
+        return
+
+    user = db.get_or_create_user(tg_user.id, tg_user.username, tg_user.first_name)
 
     if user["is_banned"]:
         await update.message.reply_text("دسترسی شما مسدود شده.")
@@ -171,8 +234,10 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb = InlineKeyboardMarkup([[
                 InlineKeyboardButton("↩️ پاسخ", callback_data=f"reply:{tg_user.id}"),
                 InlineKeyboardButton("🚫 مسدود کردن", callback_data=f"block:{tg_user.id}"),
+            ], [
+                InlineKeyboardButton("🚨 گزارش تخلف", callback_data=f"report:{tg_user.id}"),
             ]])
-            await context.bot.send_message(target_id, "برای پاسخ یا مسدود کردن:", reply_markup=kb)
+            await context.bot.send_message(target_id, "برای پاسخ، مسدود کردن یا گزارش:", reply_markup=kb)
             db.log_message(target_id, tg_user.id, "to_owner", content_type, text_content, file_id)
             await update.message.reply_text("پیامت ناشناس ارسال شد ✅")
         except Exception:
@@ -182,6 +247,27 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "برای ارسال پیام ناشناس، از لینک یه نفر استفاده کن. برای گرفتن لینک خودت «🔗 لینک من» رو بزن.",
         reply_markup=MAIN_MENU,
+    )
+
+
+async def checkjoin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    tg_user = query.from_user
+
+    not_joined = await get_not_joined_channels(context, tg_user.id)
+    if not_joined:
+        await query.answer("هنوز عضو همه‌ی کانال‌ها نشدی!", show_alert=True)
+        return
+
+    await query.answer("عضویت تایید شد ✅")
+    await query.edit_message_text("عضویت تایید شد ✅")
+
+    token = context.user_data.pop("pending_start_token", None)
+    await process_start(
+        lambda *a, **k: context.bot.send_message(tg_user.id, *a, **k),
+        context,
+        tg_user,
+        token,
     )
 
 
@@ -205,6 +291,41 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "unblock":
         db.unblock_user(owner_id, other_id)
         await query.edit_message_text("✅ این کاربر آزاد شد.")
+
+    elif action == "report":
+        sender_id = other_id
+        last_msg = db.get_last_message(owner_id, sender_id)
+        content_type = last_msg["content_type"] if last_msg else "text"
+        text_content = last_msg["text_content"] if last_msg else None
+        file_id = last_msg["file_id"] if last_msg else None
+
+        db.create_report(owner_id, sender_id, content_type, text_content, file_id)
+        sender = db.get_user_by_id(sender_id) or {}
+        body = text_content or f"[{content_type}]"
+
+        report_text = (
+            "🚨 گزارش تخلف جدید\n\n"
+            f"فرستنده: {sender.get('first_name') or '-'} "
+            f"(@{sender.get('username') or '-'}) — آیدی: {sender_id}\n"
+            f"گزارش‌دهنده: {owner_id}\n\n"
+            f"متن پیام:\n{body}"
+        )
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(admin_id, report_text)
+                if file_id:
+                    if content_type == "photo":
+                        await context.bot.send_photo(admin_id, file_id, caption="پیوست پیام گزارش‌شده")
+                    elif content_type == "video":
+                        await context.bot.send_video(admin_id, file_id, caption="پیوست پیام گزارش‌شده")
+                    elif content_type == "voice":
+                        await context.bot.send_voice(admin_id, file_id, caption="پیوست پیام گزارش‌شده")
+                    elif content_type == "sticker":
+                        await context.bot.send_sticker(admin_id, file_id)
+            except Exception:
+                logging.exception("خطا در ارسال گزارش به ادمین %s", admin_id)
+
+        await query.edit_message_text("گزارشت برای بررسی ارسال شد. ممنون که خبر دادی 🙏")
 
 
 # ---------- بخش ادمین ----------
@@ -230,6 +351,8 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/unban <آیدی>\n"
         "/tickets — تیکت‌های در انتظار\n"
         "/reply <شماره تیکت> <متن> — پاسخ سریع\n"
+        "/reports — گزارش‌های تخلف در انتظار\n"
+        "/resolvereport <شماره گزارش> — بستن گزارش\n"
         "/history <آیدی کاربر> — تاریخچه پیام‌ها"
     )
 
@@ -241,7 +364,8 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👥 کاربرها: {s['users']}\n"
         f"✉️ پیام‌ها: {s['messages']}\n"
         f"🚫 مسدودی‌ها: {s['blocks']}\n"
-        f"🆘 تیکت‌های در انتظار: {s['pending_tickets']}"
+        f"🆘 تیکت‌های در انتظار: {s['pending_tickets']}\n"
+        f"🚨 گزارش‌های در انتظار: {s['pending_reports']}"
     )
 
 
@@ -252,7 +376,10 @@ async def users_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.message.reply_text("موردی نیست.")
         return
-    lines = [f"{'🔴' if r['is_banned'] else '🟢'} {r['id']} — @{r['username'] or '-'}" for r in rows]
+    lines = [
+        f"{'🔴' if r['is_banned'] else '🟢'} {r['id']} — {r.get('first_name') or '-'} — @{r['username'] or '-'}"
+        for r in rows
+    ]
     await update.message.reply_text("\n".join(lines))
 
 
@@ -266,7 +393,8 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("پیدا نشد.")
         return
     lines = [
-        f"{'🔴' if r['is_banned'] else '🟢'} {r['id']} — @{r['username'] or '-'} — {r['created_at']}"
+        f"{'🔴' if r['is_banned'] else '🟢'} {r['id']} — {r.get('first_name') or '-'} — "
+        f"@{r['username'] or '-'} — {r['created_at']}"
         for r in rows
     ]
     await update.message.reply_text("\n".join(lines))
@@ -297,11 +425,13 @@ async def tickets(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("تیکت در انتظاری نیست.")
         return
     for t in rows:
+        sender = db.get_user_by_id(t["user_id"])
+        name = sender.get("first_name") if sender else None
         kb = InlineKeyboardMarkup(
             [[InlineKeyboardButton("↩️ پاسخ به این تیکت", callback_data=f"tkreply:{t['id']}")]]
         )
         await update.message.reply_text(
-            f"🆘 تیکت #{t['id']} از {t['user_id']}:\n{t['message']}",
+            f"🆘 تیکت #{t['id']} از {name or '-'} ({t['user_id']}):\n{t['message']}",
             reply_markup=kb,
         )
 
@@ -324,6 +454,35 @@ async def reply_ticket_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("پاسخ ارسال شد ✅")
     except Exception:
         await update.message.reply_text("ارسال پاسخ ممکن نشد (شاید کاربر بات رو بلاک کرده).")
+
+
+@admin_only
+async def reports_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = db.get_pending_reports()
+    if not rows:
+        await update.message.reply_text("گزارش در انتظاری نیست.")
+        return
+    for r in rows:
+        sender = db.get_user_by_id(r["sender_id"]) or {}
+        body = r["message_text"] or f"[{r['content_type']}]"
+        await update.message.reply_text(
+            f"🚨 گزارش #{r['id']}\n"
+            f"فرستنده: {sender.get('first_name') or '-'} (@{sender.get('username') or '-'}) — {r['sender_id']}\n"
+            f"گزارش‌دهنده: {r['owner_id']}\n"
+            f"زمان: {r['created_at']}\n\n"
+            f"متن: {body}\n\n"
+            f"برای بستن: /resolvereport {r['id']}\n"
+            f"برای مسدود کردن فرستنده: /ban {r['sender_id']}"
+        )
+
+
+@admin_only
+async def resolve_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("استفاده: /resolvereport <شماره گزارش>")
+        return
+    db.resolve_report(int(context.args[0]))
+    await update.message.reply_text("گزارش بسته شد.")
 
 
 @admin_only
@@ -381,8 +540,11 @@ def main():
     app.add_handler(CommandHandler("unban", unban))
     app.add_handler(CommandHandler("tickets", tickets))
     app.add_handler(CommandHandler("reply", reply_ticket_cmd))
+    app.add_handler(CommandHandler("reports", reports_cmd))
+    app.add_handler(CommandHandler("resolvereport", resolve_report_cmd))
     app.add_handler(CommandHandler("history", history))
 
+    app.add_handler(CallbackQueryHandler(checkjoin_handler, pattern="^checkjoin$"))
     app.add_handler(CallbackQueryHandler(admin_button_handler, pattern="^tkreply:"))
     app.add_handler(CallbackQueryHandler(button_handler))
 
